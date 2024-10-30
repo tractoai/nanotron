@@ -7,6 +7,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 # important for some distributed operations
 torchrun --nproc_per_node=8 run_train.py --config-file examples/config_tiny_llama.yaml
 ```
 """
+import os
 import argparse
 from typing import Dict, cast
 
@@ -29,6 +30,9 @@ from nanotron.parallel.pipeline_parallel.utils import get_input_output_pp_ranks
 from nanotron.trainer import DistributedTrainer
 from nanotron.utils import main_rank_first
 from torch.utils.data import DataLoader
+
+from tractorun.run import prepare_and_get_toolbox
+from tractorun.backend.tractorch import Tractorch
 
 try:
     from huggingface_hub import __version__ as hf_hub_version
@@ -226,6 +230,8 @@ def get_args():
 
 
 if __name__ == "__main__":
+    toolbox = prepare_and_get_toolbox(backend=Tractorch())
+    os.environ["RANK"] = str(toolbox.coordinator.get_self_index())
     args = get_args()
     config_file = args.config_file
 
