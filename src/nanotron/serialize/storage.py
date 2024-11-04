@@ -85,11 +85,37 @@ class LocalStorage(Storage):
 
 class TractoStorage(Storage):
     def __init__(self, yt_client: yt.YtClient, base_path: str):
+        # there is a side effect -> directory creation
+        yt_client = self._fix_client(yt_client, base_path)
         self._yt_client = yt_client
         self._base_path = base_path
 
     def precache(self):
         pass
+
+    @staticmethod
+    def _fix_client(yt_client: yt.YtClient, base_path: str):
+        tmp_dir = "//tmp/nanotron_checkpoints_tmp"
+        yt_client_config = yt.config.get_config(yt_client)
+        yt_client_config["remote_temp_files_directory"] = tmp_dir
+        yt_client_config["remote_temp_tables_directory"] = tmp_dir
+        yt_client = yt.YtClient(config=yt_client_config)
+        yt_client.create(
+            "map_node",
+            tmp_dir,
+            recursive=True,
+            ignore_existing=True,
+            attributes={
+                "primary_medium": "nvme",
+                "media": {
+                    "nvme": {
+                        "replication_factor": 3,
+                        "data_parts_only": False,
+                    },
+                },
+            },
+        )
+        return yt_client
 
     def create_directory(self, path: str):
         self._yt_client.create(

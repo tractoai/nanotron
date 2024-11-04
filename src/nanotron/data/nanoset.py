@@ -100,7 +100,7 @@ class Nanoset(torch.utils.data.Dataset):
 
         return self.datatrove_datasets[dataset][dataset_sample]
 
-    def build_nanoset_index(self) -> np.ndarray:
+    def build_nanoset_index(self) -> tuple[np.ndarray, np.ndarray]:
         """
         Build dataset index and dataset sample index
         """
@@ -111,17 +111,27 @@ class Nanoset(torch.utils.data.Dataset):
         dataset_index, dataset_sample_index = build_nanoset_index_helper(
             n_samples=samples_per_epoch, weights=self.dataset_weights, dataset_sizes=self.dataset_lengths
         )
+        # https://github.com/huggingface/nanotron/issues/237
         # Shuffle the indexes the same way
-        numpy_random_state = np.random.RandomState(self.random_seed)
-        numpy_random_state.shuffle(dataset_index)
-        numpy_random_state = np.random.RandomState(self.random_seed)
-        numpy_random_state.shuffle(dataset_sample_index)
-        # Concatenate num_epochs the shuffled indexes
-        dataset_index = np.concatenate([dataset_index for _ in range(num_epochs)])
-        dataset_sample_index = np.concatenate([dataset_sample_index for _ in range(num_epochs)])
-        # Just keep the necessary samples
-        dataset_index = dataset_index[: self.train_split_num_samples]
-        dataset_sample_index = dataset_sample_index[: self.train_split_num_samples]
+        r = np.random.RandomState(self.random_seed)
+        epoch_random_seeds = r.randint(0, 2 ** 32 - 1, num_epochs)
+        dataset_indices = []
+        dataset_sample_indices = []
+        for i in range(num_epochs):
+            # Shuffle the sample and dataset indices in epoch with same seed
+            numpy_random_state = np.random.RandomState(epoch_random_seeds[i])
+            numpy_random_state.shuffle(dataset_index)
+            numpy_random_state = np.random.RandomState(epoch_random_seeds[i])
+            numpy_random_state.shuffle(dataset_sample_index)
+
+            dataset_indices.append(dataset_index)
+            dataset_sample_indices.append(dataset_sample_index)
+
+        # Concatenate the within-epoch shuffled indexes
+        # it's a bit different with PR
+        # we have to truncate a dataset by train_split_num_samples
+        dataset_index = np.concatenate(dataset_indices)[:self.train_split_num_samples]
+        dataset_sample_index = np.concatenate(dataset_sample_indices)[:self.train_split_num_samples]
 
         return dataset_index, dataset_sample_index
 
