@@ -1,9 +1,13 @@
 checkpoints:
-  checkpoint_interval: 10
+  checkpoint_interval: 5
   checkpoints_path: checkpoints
   checkpoints_path_is_shared_file_system: false
   resume_checkpoint_path: null
   save_initial_state: false
+tracto_checkpoints:
+  checkpoints_path: //home/gritukan/checkpoint_test
+  checkpoints_medium: nvme
+  load_last_checkpoint: true
 data_stages:
 - data:
     dataset:
@@ -40,8 +44,8 @@ general:
 lighteval: null
 logging:
   iteration_step_info_interval: 1
-  log_level: info
-  log_level_replica: info
+  log_level: debug
+  log_level_replica: debug
 model:
   ddp_bucket_cap_mb: 25
   dtype: bfloat16

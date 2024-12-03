@@ -364,7 +364,7 @@ def find_optim_index_from_param_name(
 
 
 def extract_parallel_ranks_from_shard_path(
-    shard_path: Path, is_zero1: bool
+    shard_path: str, is_zero1: bool
 ) -> Union[Tuple[int, int, int], Tuple[int, int]]:
     """Extract parallel ranks from shard path
 
@@ -380,13 +380,13 @@ def extract_parallel_ranks_from_shard_path(
         # in weight checkpoints, we do pp-rank-.... but here we only do pp-...
         # TODO(xrsrke): don't hardcode this
         pattern = r"optimizer_pp-(\d+)-of-\d+_dp-(\d+)-of-\d+_tp-(\d+)-of-\d+\.pt"
-        match = re.search(pattern, str(shard_path))
+        match = re.search(pattern, shard_path)
         pp_rank, dp_rank, tp_rank = match.groups()
         return int(pp_rank), int(dp_rank), int(tp_rank)
     else:
         # NOTE: this is zero0 checkpoint
         pattern = r"pp-(\d+)-of-\d+_tp-(\d+)-of-\d+"
-        match = re.search(pattern, str(shard_path))
+        match = re.search(pattern, shard_path)
         pp_rank, tp_rank = match.groups()
         return int(pp_rank), int(tp_rank)
 
@@ -394,7 +394,8 @@ def extract_parallel_ranks_from_shard_path(
 def merge_dp_shard_in_zero1_optimizer(
     model: nn.Module,
     optimizer_config,
-    shard_paths: List[Path],
+    storage,
+    shard_paths: List[str],
     parallel_context: ParallelContext,
     map_location: Optional[str] = None,
 ) -> Dict[Tuple[int, int], Dict[str, torch.Tensor]]:  # (pp_rank, tp_rank): param_name -> optim_state
@@ -408,7 +409,7 @@ def merge_dp_shard_in_zero1_optimizer(
     ckp_sharded_optim_states = {}
     for shard_path in shard_paths:
         pp_rank, dp_rank, tp_rank = extract_parallel_ranks_from_shard_path(shard_path, is_zero1=True)
-        ckp_sharded_optim_states[(pp_rank, dp_rank, tp_rank)] = torch.load(shard_path, map_location=map_location)
+        ckp_sharded_optim_states[(pp_rank, dp_rank, tp_rank)] = storage.load(shard_path, map_location=map_location)
 
     param_name_to_dp_rank_offsets = optimizer_config["configs"]["param_name_to_dp_rank_offsets"]
     optimizer_state_names = ckp_sharded_optim_states[(0, 0, 0)]["state"][0].keys()

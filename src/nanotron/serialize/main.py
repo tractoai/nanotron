@@ -28,6 +28,7 @@ from nanotron.serialize.optimizer import (
     save_lr_scheduler,
     save_optimizer,
 )
+from nanotron.serialize.storage import Storage
 from nanotron.serialize.weights import load_weights, save_weights
 
 """
@@ -56,7 +57,7 @@ def save(
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
     parallel_context: ParallelContext,
     training_metadata: TrainingMetadata,
-    root_folder: Path,
+    storage: Storage,
     should_save_config: bool = True,
     should_save_model: bool = True,
     should_save_optimizer: bool = True,
@@ -67,7 +68,7 @@ def save(
 
     try:
         if should_save_config:
-            config.save_as_yaml(root_folder / "config.yaml")
+            storage.write_file("config.yaml", config.save_as_bytes())
     except Exception as e:
         # TODO @nouamane: catch full disk error
         log_rank(
@@ -79,7 +80,7 @@ def save(
         raise e
     try:
         if should_save_model:
-            save_weights(model=model, parallel_context=parallel_context, root_folder=root_folder)
+            save_weights(model=model, parallel_context=parallel_context, storage=storage)
     except Exception as e:
         log_rank(
             f"Error while saving weights checkpoint: {e}",
@@ -90,7 +91,7 @@ def save(
         raise e
     try:
         if should_save_optimizer:
-            save_optimizer(optimizer=optimizer, parallel_context=parallel_context, root_folder=root_folder)
+            save_optimizer(optimizer=optimizer, parallel_context=parallel_context, storage=storage)
     except Exception as e:
         log_rank(
             f"Error while saving optimizer checkpoint: {e}",
@@ -109,7 +110,7 @@ def save(
             save_lr_scheduler(
                 lr_scheduler=lr_scheduler,
                 parallel_context=parallel_context,
-                root_folder=root_folder,
+                storage=storage,
             )
     except Exception as e:
         log_rank(
@@ -120,7 +121,7 @@ def save(
         )
         raise e
 
-    save_meta(root_folder=root_folder, parallel_context=parallel_context, training_metadata=training_metadata)
+    save_meta(parallel_context=parallel_context, training_metadata=training_metadata, storage=storage)
 
     # TODO @thomas21: sanity check, not sure whether that needs to happen at testing or now (depends how much it costs)
     ###
@@ -239,6 +240,7 @@ def load(
     load_lr_scheduler(
         lr_scheduler=lr_scheduler,
         root_folder=root_folder,
+        parallel_context=parallel_context,
     )
     return checkpoint_metadata
 

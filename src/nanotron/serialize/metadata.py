@@ -12,6 +12,7 @@ from nanotron import distributed as dist
 from nanotron.constants import CHECKPOINT_FILE_NAME, CHECKPOINT_VERSION
 from nanotron.parallel import ParallelContext
 from nanotron.parallel.parameters import SlicesPair
+from nanotron.serialize.storage import Storage
 
 
 @dataclasses.dataclass
@@ -125,13 +126,12 @@ def to_list(list_: Union[List, Tuple], type_hooks: Dict[Type, Callable[[Any], An
     return list_.__class__((process_type(elt, type_hooks=type_hooks) for elt in list_))
 
 
-def save_meta(parallel_context: ParallelContext, root_folder: Path, training_metadata: TrainingMetadata):
+def save_meta(parallel_context: ParallelContext, storage: Storage, training_metadata: TrainingMetadata):
     assert isinstance(training_metadata, TrainingMetadata)
 
     if dist.get_rank(parallel_context.world_pg) != 0:
         return
 
-    root_folder.mkdir(exist_ok=True, parents=True)
     checkpoint_metadata = CheckpointMetadata(
         version=CHECKPOINT_VERSION,
         tp=parallel_context.tp_pg.size(),
@@ -142,22 +142,22 @@ def save_meta(parallel_context: ParallelContext, root_folder: Path, training_met
     # There are some types that require manual casting in order to work correctly.
     processed_metadata = process_type(dataclasses.asdict(checkpoint_metadata), type_hooks={Version: lambda x: str(x)})
 
-    with open(root_folder / CHECKPOINT_FILE_NAME, mode="w") as fo:
-        json.dump(processed_metadata, fo, indent=2, sort_keys=True)
+    s = json.dumps(processed_metadata, indent=2, sort_keys=True)
+    storage.write_file(CHECKPOINT_FILE_NAME, s.encode("utf-8"))
 
 
-def load_meta(parallel_context: ParallelContext, root_folder: Path) -> CheckpointMetadata:
-    with open(root_folder / CHECKPOINT_FILE_NAME, mode="r") as fi:
-        checkpoint_metadata = json.load(fi)
-        checkpoint_metadata = from_dict(
-            data_class=CheckpointMetadata,
-            data=checkpoint_metadata,
-            config=dacite.Config(
-                cast=[Version],
-            ),
-        )
-        # Assume that we're always backward compatible, we only increment CHECKPOINT_VERSION when there's a breaking change.
-        assert (
-            checkpoint_metadata.version <= CHECKPOINT_VERSION
-        ), f"Checkpoint is of version {checkpoint_metadata.version}, Current `nanotron` checkpoint version is {CHECKPOINT_VERSION}"
+def load_meta(parallel_context: ParallelContext, storage: Storage) -> CheckpointMetadata:
+    checkpoint_metadata = storage.read_file(CHECKPOINT_FILE_NAME).decode()
+    checkpoint_metadata = json.loads(checkpoint_metadata)
+    checkpoint_metadata = from_dict(
+        data_class=CheckpointMetadata,
+        data=checkpoint_metadata,
+        config=dacite.Config(
+            cast=[Version],
+        ),
+    )
+    # Assume that we're always backward compatible, we only increment CHECKPOINT_VERSION when there's a breaking change.
+    assert (
+        checkpoint_metadata.version <= CHECKPOINT_VERSION
+    ), f"Checkpoint is of version {checkpoint_metadata.version}, Current `nanotron` checkpoint version is {CHECKPOINT_VERSION}"
     return checkpoint_metadata

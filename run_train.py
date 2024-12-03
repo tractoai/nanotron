@@ -236,7 +236,7 @@ if __name__ == "__main__":
     config_file = args.config_file
 
     # Load trainer and data
-    trainer = DistributedTrainer(config_file)
+    trainer = DistributedTrainer(config_file, toolbox=toolbox)
     dataloader = get_dataloader(trainer)
 
     # Train

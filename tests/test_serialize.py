@@ -31,6 +31,8 @@ from nanotron.serialize import (
     save_optimizer,
     save_random_states,
     save_weights,
+    LocalStorage,
+    TractoStorage,
 )
 from nanotron.serialize.metadata import TensorMetadata
 from torch.nn.parallel import DistributedDataParallel
@@ -41,6 +43,7 @@ def test_save_and_load_with_changed_topolgy():
     return
 
 
+@pytest.mark.parametrize("use_tracto", [True, False])
 @pytest.mark.parametrize(
     "tp,dp,pp",
     [
@@ -50,18 +53,18 @@ def test_save_and_load_with_changed_topolgy():
     ],
 )
 @rerun_if_address_is_in_use()
-def test_save_and_load_model(tp: int, dp: int, pp: int):
+def test_save_and_load_model(tp: int, dp: int, pp: int, use_tracto: bool):
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
-    init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_and_load_model)(test_context=test_context)
+    init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_and_load_model)(test_context=test_context, use_tracto=use_tracto)
 
 
-def _test_save_and_load_model(parallel_context: ParallelContext, test_context: TestContext):
+def _test_save_and_load_model(parallel_context: ParallelContext, test_context: TestContext, use_tracto: bool):
     model = init_dummy_model(parallel_context=parallel_context)
-    store_folder = test_context.get_auto_remove_tmp_dir()
+    storage = test_context.get_storage(use_tracto=use_tracto)
 
     # Save
-    save_weights(model=model, parallel_context=parallel_context, root_folder=store_folder)
+    save_weights(model=model, parallel_context=parallel_context, storage=storage)
 
     # Load
     new_model = init_dummy_model(parallel_context=parallel_context)
@@ -74,7 +77,7 @@ def _test_save_and_load_model(parallel_context: ParallelContext, test_context: T
     else:
         assert not match, "Newly initialised model should not match."
 
-    load_weights(model=new_model, parallel_context=parallel_context, root_folder=store_folder)
+    load_weights(model=new_model, parallel_context=parallel_context, storage=storage)
 
     # Assert the weights are exactly the same after loading
     match, msg = is_dict_equal(new_model.state_dict(), model.state_dict())
@@ -83,6 +86,7 @@ def _test_save_and_load_model(parallel_context: ParallelContext, test_context: T
     parallel_context.destroy()
 
 
+@pytest.mark.parametrize("use_tracto", [True, False])
 @pytest.mark.parametrize(
     "tp,dp,pp",
     [
@@ -92,14 +96,14 @@ def _test_save_and_load_model(parallel_context: ParallelContext, test_context: T
     ],
 )
 @rerun_if_address_is_in_use()
-def test_save_and_load_optimizer(tp: int, dp: int, pp: int):
+def test_save_and_load_optimizer(tp: int, dp: int, pp: int, use_tracto: bool):
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
-    init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_and_load_optimizer)(test_context=test_context)
+    init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_and_load_optimizer)(test_context=test_context, use_tracto=use_tracto)
 
 
-def _test_save_and_load_optimizer(parallel_context: ParallelContext, test_context: TestContext):
-    store_folder = test_context.get_auto_remove_tmp_dir()
+def _test_save_and_load_optimizer(parallel_context: ParallelContext, test_context: TestContext, use_tracto: bool):
+    storage = test_context.get_storage(use_tracto=use_tracto)
     model = init_dummy_model(parallel_context=parallel_context)
     optimizer = NamedOptimizer(
         named_params_or_groups=model.named_parameters(),
@@ -122,7 +126,7 @@ def _test_save_and_load_optimizer(parallel_context: ParallelContext, test_contex
         optimizer.zero_grad()
 
     # Save optimizer
-    save_optimizer(optimizer=optimizer, parallel_context=parallel_context, root_folder=store_folder)
+    save_optimizer(optimizer=optimizer, parallel_context=parallel_context, storage=storage)
     dist.barrier(parallel_context.world_pg)
 
     # Generate a new optimizer
@@ -139,7 +143,7 @@ def _test_save_and_load_optimizer(parallel_context: ParallelContext, test_contex
     else:
         assert not match, "Newly initialised optimizer should not match."
 
-    load_optimizer(optimizer=new_optimizer, parallel_context=parallel_context, root_folder=store_folder)
+    load_optimizer(optimizer=new_optimizer, parallel_context=parallel_context, storage=storage)
 
     # Assert the optimizer states are exactly the same after loading.
     match, msg = is_dict_equal(optimizer.state_dict(), new_optimizer.state_dict())
@@ -148,6 +152,7 @@ def _test_save_and_load_optimizer(parallel_context: ParallelContext, test_contex
     parallel_context.destroy()
 
 
+@pytest.mark.parametrize("use_tracto", [True, False])
 @pytest.mark.parametrize(
     "tp,dp,pp",
     [
@@ -157,14 +162,14 @@ def _test_save_and_load_optimizer(parallel_context: ParallelContext, test_contex
     ],
 )
 @rerun_if_address_is_in_use()
-def test_save_zero_optimizer_and_load_optimizer(tp: int, dp: int, pp: int):
+def test_save_zero_optimizer_and_load_optimizer(tp: int, dp: int, pp: int, use_tracto: bool):
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
-    init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_zero_optimizer_and_load_optimizer)(test_context=test_context)
+    init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_zero_optimizer_and_load_optimizer)(test_context=test_context, use_tracto=use_tracto)
 
 
-def _test_save_zero_optimizer_and_load_optimizer(parallel_context: ParallelContext, test_context: TestContext):
-    store_folder = test_context.get_auto_remove_tmp_dir()
+def _test_save_zero_optimizer_and_load_optimizer(parallel_context: ParallelContext, test_context: TestContext, use_tracto: bool):
+    storage = test_context.get_storage(use_tracto=use_tracto)
     model = init_dummy_model(parallel_context=parallel_context)
     optimizer = ZeroDistributedOptimizer(
         named_params_or_groups=model.named_parameters(),
@@ -191,7 +196,7 @@ def _test_save_zero_optimizer_and_load_optimizer(parallel_context: ParallelConte
         optimizer.zero_grad()
 
     # Save optimizer
-    save_optimizer(optimizer=optimizer, parallel_context=parallel_context, root_folder=store_folder)
+    save_optimizer(optimizer=optimizer, parallel_context=parallel_context, storage=storage)
     dist.barrier(parallel_context.world_pg)
 
     # Generate a new optimizer
@@ -212,7 +217,7 @@ def _test_save_zero_optimizer_and_load_optimizer(parallel_context: ParallelConte
     else:
         assert not match, "Newly initialised optimizer should not match."
 
-    load_optimizer(optimizer=new_optimizer, parallel_context=parallel_context, root_folder=store_folder)
+    load_optimizer(optimizer=new_optimizer, parallel_context=parallel_context, storage=storage)
 
     # Assert the optimizer states are exactly the same after loading.
     match, msg = is_dict_equal(optimizer.state_dict(), new_optimizer.state_dict())
@@ -221,6 +226,7 @@ def _test_save_zero_optimizer_and_load_optimizer(parallel_context: ParallelConte
     parallel_context.destroy()
 
 
+@pytest.mark.parametrize("use_tracto", [True, False])
 @pytest.mark.skip(reason="Assumption that zero and non zero optimizer have the same serialization format doesn't hold")
 @pytest.mark.parametrize(
     "tp,dp,pp",
@@ -231,18 +237,19 @@ def _test_save_zero_optimizer_and_load_optimizer(parallel_context: ParallelConte
     ],
 )
 @rerun_if_address_is_in_use()
-def test_save_zero_optimizer_and_load_data_parallel_optimizer(tp: int, dp: int, pp: int):
+def test_save_zero_optimizer_and_load_data_parallel_optimizer(tp: int, dp: int, pp: int, use_tracto: bool):
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_zero_optimizer_and_load_data_parallel_optimizer)(
-        test_context=test_context
+        test_context=test_context,
+        use_tracto=use_tracto,
     )
 
 
 def _test_save_zero_optimizer_and_load_data_parallel_optimizer(
-    parallel_context: ParallelContext, test_context: TestContext
+    parallel_context: ParallelContext, test_context: TestContext, use_tracto: bool,
 ):
-    store_folder = test_context.get_auto_remove_tmp_dir()
+    storage = test_context.get_storage(use_tracto=use_tracto)
     model = init_dummy_model(parallel_context=parallel_context)
     optimizer = ZeroDistributedOptimizer(
         named_params_or_groups=model.named_parameters(),
@@ -269,7 +276,7 @@ def _test_save_zero_optimizer_and_load_data_parallel_optimizer(
         optimizer.zero_grad()
 
     # Save optimizer
-    save_optimizer(optimizer=optimizer, parallel_context=parallel_context, root_folder=store_folder)
+    save_optimizer(optimizer=optimizer, parallel_context=parallel_context, storage=storage)
     dist.barrier(parallel_context.world_pg)
 
     # Generate a new optimizer
@@ -286,13 +293,14 @@ def _test_save_zero_optimizer_and_load_data_parallel_optimizer(
     else:
         assert not match, "Newly initialised optimizer should not match."
 
-    load_optimizer(optimizer=new_optimizer, parallel_context=parallel_context, root_folder=store_folder)
+    load_optimizer(optimizer=new_optimizer, parallel_context=parallel_context, storage=storage)
 
     # TODO @thomasw21: Compare zero optimizer with non zero
     parallel_context.destroy()
 
 
 @pytest.mark.skip(reason="Assumption that zero and non zero optimizer have the same serialization format doesn't hold")
+@pytest.mark.parametrize("use_tracto", [True, False])
 @pytest.mark.parametrize(
     "tp,dp,pp",
     [
@@ -302,18 +310,18 @@ def _test_save_zero_optimizer_and_load_data_parallel_optimizer(
     ],
 )
 @rerun_if_address_is_in_use()
-def test_save_data_parallel_optimizer_and_load_zero_optimizer(tp: int, dp: int, pp: int):
+def test_save_data_parallel_optimizer_and_load_zero_optimizer(tp: int, dp: int, pp: int, use_tracto: bool):
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_data_parallel_optimizer_and_load_zero_optimizer)(
-        test_context=test_context
+        test_context=test_context, use_tracto=use_tracto,
     )
 
 
 def _test_save_data_parallel_optimizer_and_load_zero_optimizer(
-    parallel_context: ParallelContext, test_context: TestContext
+    parallel_context: ParallelContext, test_context: TestContext, use_tracto: bool,
 ):
-    store_folder = test_context.get_auto_remove_tmp_dir()
+    storage = test_context.get_storage(use_tracto=use_tracto)
     model = init_dummy_model(parallel_context=parallel_context)
     optimizer = NamedOptimizer(
         named_params_or_groups=model.named_parameters(),
@@ -333,7 +341,7 @@ def _test_save_data_parallel_optimizer_and_load_zero_optimizer(
         optimizer.zero_grad()
 
     # Save optimizer
-    save_optimizer(optimizer=optimizer, parallel_context=parallel_context, root_folder=store_folder)
+    save_optimizer(optimizer=optimizer, parallel_context=parallel_context, storage=storage)
     dist.barrier(parallel_context.world_pg)
 
     # Generate a new optimizer
@@ -354,12 +362,12 @@ def _test_save_data_parallel_optimizer_and_load_zero_optimizer(
     else:
         assert not match, "Newly initialised optimizer should not match."
 
-    load_optimizer(optimizer=new_optimizer, parallel_context=parallel_context, root_folder=store_folder)
+    load_optimizer(optimizer=new_optimizer, parallel_context=parallel_context, storage=storage)
 
     # TODO @thomasw21: Compare zero optimizer with non zero
     parallel_context.destroy()
 
-
+@pytest.mark.parametrize("use_tracto", [True, False])
 @pytest.mark.parametrize(
     "tp,dp,pp",
     [
@@ -369,17 +377,20 @@ def _test_save_data_parallel_optimizer_and_load_zero_optimizer(
     ],
 )
 @rerun_if_address_is_in_use()
-def test_save_optimizer_with_additional_state_dict_keys(tp: int, dp: int, pp: int):
+def test_save_optimizer_with_additional_state_dict_keys(tp: int, dp: int, pp: int, use_tracto: bool):
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_optimizer_with_additional_state_dict_keys)(
-        test_context=test_context
+        test_context=test_context,
+        use_tracto=use_tracto,
     )
 
 
-def _test_save_optimizer_with_additional_state_dict_keys(parallel_context: ParallelContext, test_context: TestContext):
+def _test_save_optimizer_with_additional_state_dict_keys(
+    parallel_context: ParallelContext, test_context: TestContext, use_tracto: bool,
+):
     dtype = torch.float16
-    store_folder = test_context.get_auto_remove_tmp_dir()
+    storage = test_context.get_storage(use_tracto=use_tracto)
     model = init_dummy_model(parallel_context=parallel_context, dtype=dtype)
 
     if isinstance(model, DistributedDataParallel):
@@ -424,7 +435,7 @@ def _test_save_optimizer_with_additional_state_dict_keys(parallel_context: Paral
         optimizer.zero_grad()
 
     # Save optimizer
-    save_optimizer(optimizer=optimizer, parallel_context=parallel_context, root_folder=store_folder)
+    save_optimizer(optimizer=optimizer, parallel_context=parallel_context, storage=storage)
     dist.barrier(parallel_context.world_pg)
 
     # Generate a new optimizer
@@ -445,7 +456,7 @@ def _test_save_optimizer_with_additional_state_dict_keys(parallel_context: Paral
         match, msg = is_dict_equal(optimizer.state_dict(), new_optimizer.state_dict())
         assert not match, "Newly initialised optimizer should not match."
 
-    load_optimizer(optimizer=new_optimizer, parallel_context=parallel_context, root_folder=store_folder)
+    load_optimizer(optimizer=new_optimizer, parallel_context=parallel_context, storage=storage)
 
     # Assert the optimizer states are exactly the same after loading.
     match, msg = is_dict_equal(optimizer.state_dict()["state"], new_optimizer.state_dict()["state"])
@@ -476,14 +487,15 @@ def _test_save_optimizer_with_additional_state_dict_keys(parallel_context: Paral
 
 
 @pytest.mark.skipif(available_gpus() < 2, reason="Testing test_save_and_load_random_states requires at least 2 gpus")
+@pytest.mark.parametrize("use_tracto", [True, False])
 @rerun_if_address_is_in_use()
-def test_save_and_load_random_states():
+def test_save_and_load_random_states(use_tracto: bool):
     test_context = TestContext()
     # We use DP=2 as we're interested in testing
-    init_distributed(tp=2, dp=1, pp=1)(_test_save_and_load_random_states)(test_context=test_context)
+    init_distributed(tp=2, dp=1, pp=1)(_test_save_and_load_random_states)(test_context=test_context, use_tracto=use_tracto)
 
 
-def _test_save_and_load_random_states(parallel_context: ParallelContext, test_context: TestContext):
+def _test_save_and_load_random_states(parallel_context: ParallelContext, test_context: TestContext, use_tracto: bool):
     pg = next(
         (pg for pg in [parallel_context.tp_pg, parallel_context.dp_pg, parallel_context.pp_pg] if pg.size() == 2)
     )
@@ -493,7 +505,7 @@ def _test_save_and_load_random_states(parallel_context: ParallelContext, test_co
             "my_own_random_state": get_current_random_state(),
         }
     )
-    store_folder = test_context.get_auto_remove_tmp_dir()
+    storage = test_context.get_storage(use_tracto=use_tracto)
 
     # Check that random states are unequal between ranks (due to `my_own_random_state`)
     reference_rank = 0
@@ -506,10 +518,10 @@ def _test_save_and_load_random_states(parallel_context: ParallelContext, test_co
         assert random_states != random_statess[0]
 
     # save
-    save_random_states(random_states=random_states, parallel_context=parallel_context, root_folder=store_folder)
+    save_random_states(random_states=random_states, parallel_context=parallel_context, storage=storage)
 
     # load
-    new_random_states = load_random_states(parallel_context=parallel_context, root_folder=store_folder)
+    new_random_states = load_random_states(parallel_context=parallel_context, storage=storage)
     # Each rank has restored it's own random state
     assert random_states == new_random_states
 
@@ -517,7 +529,7 @@ def _test_save_and_load_random_states(parallel_context: ParallelContext, test_co
 
 
 @rerun_if_address_is_in_use()
-def test_serialize_deserialize_tensormetadata():
+def test_serialize_deserialize_tensormetadata(use_tracto: bool):
     test_context = TestContext()
     init_distributed(tp=2, dp=1, pp=1)(_test_serialize_deserialize_tensormetadata)(test_context=test_context)
 

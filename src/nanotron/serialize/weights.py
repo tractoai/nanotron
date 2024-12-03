@@ -2,9 +2,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import dacite
+import fnmatch
 import torch
 from packaging.version import Version
-from safetensors.torch import safe_open, save_file
 from torch import nn
 from tqdm import tqdm
 
@@ -23,12 +23,13 @@ from nanotron.serialize.utils import (
     get_path,
     merge_and_shard_tp_tensors,
 )
+from nanotron.serialize.storage import Storage
 
 logger = logging.get_logger(__name__)
 
 
-def save_weights(model: nn.Module, parallel_context: ParallelContext, root_folder: Path):
-    root_folder = root_folder / "model"
+def save_weights(model: nn.Module, parallel_context: ParallelContext, storage: Storage):
+    storage.create_directory("model")
 
     # We save only `dist.get_rank(parallel_context.dp_pg) == 0`
     # TODO @thomasw21: Figure how this works with Zero-3
@@ -86,17 +87,17 @@ def save_weights(model: nn.Module, parallel_context: ParallelContext, root_folde
                 exp_tp_pp_rank_and_size = None
                 is_expert_sharded = False
 
-            path = get_path(
+            filename = get_path(
                 base_name,
                 type=ObjectType.MODEL,
                 exp_tp_pp_rank_and_size=exp_tp_pp_rank_and_size,
                 is_expert_sharded=is_expert_sharded,
-                prefix=root_folder,
             )
-            path.parent.mkdir(exist_ok=True, parents=True)
+            path = f"model/{filename}"
+
             try:
                 tensors = {"data": param_or_buffer}
-                save_file(tensors=tensors, filename=path, metadata=metadata)
+                storage.save(path, tensors, metadata=metadata)
             except Exception as e:
                 log_rank(
                     f"Error saving {path} with {metadata}",
@@ -113,65 +114,65 @@ class CheckpointVersionFromShardFileException(Exception):
     """Raise when loading checkpoint version from shard file fails"""
 
 
-def read_checkpoint_version_from_shard_file(param_save_path: Path) -> Version:
+def read_checkpoint_version_from_shard_file(storage: Storage, path: str) -> Version:
     try:
-        with safe_open(param_save_path, framework="pt", device=str("cpu")) as fi:
-            param_metadata = fi.metadata()
-            param_metadata = TensorMetadata.from_str_dict(param_metadata)
-            checkpoint_version = param_metadata.version
+        param_metadata = storage.read_metadata(path)
+        param_metadata = TensorMetadata.from_str_dict(param_metadata)
+        checkpoint_version = param_metadata.version
     except (dacite.exceptions.MissingValueError, dacite.exceptions.UnexpectedDataError):
         raise CheckpointVersionFromShardFileException()
     return checkpoint_version
 
 
-def read_checkpoint_version_from_meta(parallel_context: ParallelContext, root_folder: Path) -> Version:
-    checkpoint_metadata: CheckpointMetadata = load_meta(parallel_context=parallel_context, root_folder=root_folder)
+def read_checkpoint_version_from_meta(parallel_context: ParallelContext, storage: Storage) -> Version:
+    checkpoint_metadata: CheckpointMetadata = load_meta(parallel_context=parallel_context, storage=storage)
     checkpoint_version = checkpoint_metadata.version
     return checkpoint_version
 
 
-def get_checkpoint_version(parallel_context, root_folder, param_save_path: Path) -> Version:
+def get_checkpoint_version(parallel_context, storage: Storage, path: str) -> Version:
     try:
-        checkpoint_version = read_checkpoint_version_from_shard_file(param_save_path=param_save_path)
+        checkpoint_version = read_checkpoint_version_from_shard_file(storage, path)
     except CheckpointVersionFromShardFileException:
         log_rank(
-            f"Failed to read checkpoint version from shard file {param_save_path}, reading from meta file.",
+            f"Failed to read checkpoint version from shard file {path}, reading from meta file.",
             logger=logger,
             level=logging.ERROR,
             rank=0,
         )
-        checkpoint_version = read_checkpoint_version_from_meta(
-            parallel_context=parallel_context, root_folder=root_folder
-        )
+        checkpoint_version = read_checkpoint_version_from_meta(parallel_context, storage)
     return checkpoint_version
 
 
 def load_sharded_param_latest(
     param_or_buffer: torch.Tensor,
     sharded_info: ShardedInfo,
-    shards_path: List[Path],
+    storage: Storage,
+    shards_path: List[str],
     param_shard_metadata: Optional[Dict] = None,
 ):
     checkpoint_unsharded_shape = None
     shards_and_slices_maps: List[Tuple[torch.Tensor, Tuple[SlicesPair, ...]]] = []
 
     for shard_path in shards_path:
-        with safe_open(shard_path, framework="pt", device=str(param_or_buffer.device)) as fi:
-            # TODO @thomasw21: Choose only a slice if we switch the TP topology
-            param_metadata = fi.metadata()
-            param_metadata = TensorMetadata.from_str_dict(param_metadata)
-            shards_and_slices_maps.append((fi.get_tensor("data"), param_metadata.local_global_slices_pairs))
+        # TODO @thomasw21: Choose only a slice if we switch the TP topology
+        param_metadata = storage.read_metadata(shard_path)
+        param_metadata = TensorMetadata.from_str_dict(param_metadata)
 
-            if checkpoint_unsharded_shape is None:
-                checkpoint_unsharded_shape = param_metadata.unsharded_shape
-            else:
-                assert checkpoint_unsharded_shape == param_metadata.unsharded_shape
+        tensor = storage.load(shard_path, map_location=param_or_buffer.device)
+        tensor = tensor["data"]
+        shards_and_slices_maps.append((tensor, param_metadata.local_global_slices_pairs))
 
-            if param_shard_metadata is not None:
-                # NOTE: store how does model parameter are sharded
-                # so that we can shard optimizer checkpoints in this way
-                pp_rank, tp_rank = extract_tp_pp_rank_from_shard_path(shard_path)
-                param_shard_metadata[(pp_rank, tp_rank)] = param_metadata
+        if checkpoint_unsharded_shape is None:
+            checkpoint_unsharded_shape = param_metadata.unsharded_shape
+        else:
+            assert checkpoint_unsharded_shape == param_metadata.unsharded_shape
+
+        if param_shard_metadata is not None:
+            # NOTE: store how does model parameter are sharded
+            # so that we can shard optimizer checkpoints in this way
+            pp_rank, tp_rank = extract_tp_pp_rank_from_shard_path(shard_path)
+            param_shard_metadata[(pp_rank, tp_rank)] = param_metadata
 
     assert checkpoint_unsharded_shape is not None
     # TODO @thomasw21: Interestingly enough we don't actually need to instantiate the entire model at all.
@@ -190,7 +191,7 @@ def load_sharded_param_latest(
 def load_weights(
     model: nn.Module,
     parallel_context: ParallelContext,
-    root_folder: Path,
+    storage: Storage,
     filtered_state_dict: Optional[Dict[str, Any]] = None,
 ):
     """Load weights from a checkpoint
@@ -201,8 +202,6 @@ def load_weights(
         root_folder: root folder of the checkpoint
         filtered_state_dict: state dict to load from (overrides model.state_dict()). if None, load from model.state_dict()
     """
-    param_root_folder = root_folder / "model"
-
     module_id_to_prefix = {id(module): f"{module_name}." for module_name, module in model.named_modules()}
     # Fix the root_model
     module_id_to_prefix[id(model)] = ""
@@ -250,23 +249,20 @@ def load_weights(
                 exp_tp_pp_rank_and_size = None
                 is_expert_sharded = False
 
-            path = get_path(
+            path = "model/" + get_path(
                 base_name,
                 type=ObjectType.MODEL,
                 exp_tp_pp_rank_and_size=exp_tp_pp_rank_and_size,
-                prefix=param_root_folder,
                 is_expert_sharded=is_expert_sharded,
             )
 
-            if path.exists():
-                with safe_open(path, framework="pt", device=str(param.device)) as fi:
-                    # TODO @thomasw21: Choose only a slice if we switch the TP topology
-                    param_or_buffer[:] = fi.get_tensor("data")
-
-            elif not path.parent.exists():
+            if storage.exists(path):
+                tensor = storage.load(path, map_location=param_or_buffer.device)
+                param_or_buffer[:] = tensor["data"]
+            elif not storage.exists("model"):
                 raise ValueError(
-                    f"Checkpoint is empty or checkpoint structure is not matching the model architecture."
-                    f"Couldn't find folder {path.parent} in checkpoint at {root_folder}"
+                    f"Checkpoint is empty or checkpoint structure is not matching the model architecture. "
+                    f"Couldn't find model folder in checkpoint"
                 )
             else:
                 # Let's assume that the topology changed and the param is sharded.
@@ -279,22 +275,27 @@ def load_weights(
                 # TODO @thomasw21: Make so that we don't need to code this logic somewhere else than in `get_path`
                 sharded_info = param.get_sharded_info()
                 suffix = base_name.rsplit(".", 1)[-1]
-                shards_path = list(path.parent.glob(f"{ObjectType.MODEL.value}_{suffix}*.safetensors"))
+                pattern = f"{ObjectType.MODEL.value}_{suffix}*.safetensors"
+                shards_path = []
+                for path in storage.list_dir("model"):
+                    if fnmatch.fnmatch(path, pattern):
+                        shards_path.append(path)
                 if len(shards_path) <= 0:
                     raise ValueError(
-                        f"Could not find any shards {ObjectType.MODEL.value}_{suffix}*.safetensors in {path.parent}."
+                        f"Could not find any shards {pattern} in model directory."
                         f"If you notice `.safetensors` in the middle of the name of some of the checkpoints files. You need to run `scripts/fix_checkpoint_bad_naming.py`."
                     )
 
                 if checkpoint_version is None:
                     checkpoint_version = get_checkpoint_version(
-                        parallel_context, root_folder, param_save_path=shards_path[0]
+                        parallel_context, storage, param_save_path=shards_path[0]
                     )
                 else:
                     current_checkpoint_version = None
                     try:
                         current_checkpoint_version = read_checkpoint_version_from_shard_file(
-                            param_save_path=shards_path[0]
+                            storage,
+                            shards_path[0],
                         )
                     except CheckpointVersionFromShardFileException:
                         # The checkpoint version is read from the meta file
@@ -308,6 +309,7 @@ def load_weights(
                     load_sharded_param_latest(
                         param_or_buffer=param_or_buffer,
                         sharded_info=sharded_info,
+                        storage=storage,
                         shards_path=shards_path,
                         param_shard_metadata=param_shard_metadata[name],
                     )

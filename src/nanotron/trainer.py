@@ -91,9 +91,14 @@ from nanotron.serialize import (
     parse_ckpt_path,
     save,
     save_random_states,
+    LocalStorage,
+    TractoStorage,
+    CachingTractoStorage,
 )
 from nanotron.serialize.metadata import DataStageMetadata, TrainingMetadata
 from nanotron.serialize.optimizer import load_optimizer
+
+from tractorun.toolbox import Toolbox
 
 logger = logging.get_logger(__name__)
 
@@ -119,6 +124,7 @@ class DistributedTrainer:
         config_class: Type[Config] = Config,
         model_config_class: Optional[Type] = None,
         model_class: Type[NanotronModel] = None,
+        toolbox: Optional[Toolbox] = None,
     ):
         """
         Nanotron's distributed trainer.
@@ -131,6 +137,7 @@ class DistributedTrainer:
         """
 
         super().__init__()
+        self.toolbox = toolbox
         self.config = get_config_from_file(
             config_or_config_file, config_class=config_class, model_config_class=model_config_class
         )
@@ -150,10 +157,16 @@ class DistributedTrainer:
             expert_parallel_size=self.config.parallelism.expert_parallel_size,
         )
 
-        self.pre_init()
-
         # Set log levels
         set_ranks_logging_level(parallel_context=self.parallel_context, logging_config=self.config.logging)
+
+        self.pre_init()
+
+        if self.init_checkpoint_storage is not None:
+            if os.environ["LOCAL_RANK"] == "0":
+                self.init_checkpoint_storage.precache()
+            # Wait until everyone downloaded the checkpoint.
+            dist.barrier()
 
         # Log benchmark info
         if os.environ.get("NANOTRON_BENCHMARK", "0") == "1":
@@ -189,11 +202,11 @@ class DistributedTrainer:
             optimizer_args=self.config.optimizer,
             parallel_context=self.parallel_context,
         )
-        if self.init_checkpoint_path is not None:
+        if self.init_checkpoint_storage is not None:
             load_optimizer(
                 optimizer=self.optimizer,
                 parallel_context=self.parallel_context,
-                root_folder=self.init_checkpoint_path,
+                storage=self.init_checkpoint_storage,
                 param_shard_metadata=self.param_shard_metadata,
                 model=self.model,
             )
@@ -204,16 +217,17 @@ class DistributedTrainer:
             lr_scheduler_args=self.config.optimizer.learning_rate_scheduler,
             total_training_steps=self.config.tokens.train_steps,
         )
-        if self.init_checkpoint_path is not None:
+        if self.init_checkpoint_storage is not None:
             load_lr_scheduler(
                 lr_scheduler=self.lr_scheduler,
-                root_folder=self.init_checkpoint_path,
+                storage=self.init_checkpoint_storage,
+                parallel_context=self.parallel_context,
             )
 
         # Define iteration start state
-        if self.init_checkpoint_path is not None:
+        if self.init_checkpoint_storage is not None:
             checkpoint_metadata = load_meta(
-                parallel_context=self.parallel_context, root_folder=self.init_checkpoint_path
+                parallel_context=self.parallel_context, storage=self.init_checkpoint_storage,
             )
             assert isinstance(checkpoint_metadata.metas, TrainingMetadata)
             log_rank(str(checkpoint_metadata), logger=logger, level=logging.INFO, rank=0)
@@ -256,7 +270,90 @@ class DistributedTrainer:
         self.post_init()
 
     def pre_init(self):
-        self.init_checkpoint_path = parse_ckpt_path(config=self.config, parallel_context=self.parallel_context)
+        self.init_checkpoint_storage = None
+        local_path = parse_ckpt_path(config=self.config, parallel_context=self.parallel_context)
+        if self.config.tracto_checkpoints is not None:
+            ytc = self.toolbox.yt_client
+            checkpoints_path = self.config.tracto_checkpoints.checkpoints_path
+            log_rank("Using Tracto checkpoints with path: " + checkpoints_path, logger=logger, level=logging.INFO, rank=0)
+            medium = self.config.tracto_checkpoints.checkpoints_medium
+            if medium is not None and dist.get_rank(self.parallel_context.world_pg) == 0:
+                log_rank(f"Setting medium \"{medium}\" for Tracto checkpoints", logger=logger, level=logging.INFO, rank=0)
+                ytc.set(checkpoints_path + "/@primary_medium", medium)
+            checkpoint_path = self.config.tracto_checkpoints.resume_checkpoint_path
+            if checkpoint_path is not None:
+                log_rank("Resuming from provided checkpoint path: " + checkpoints_path, logger=logger, level=logging.INFO, rank=0)
+                self.init_checkpoint_storage = TractoStorage(ytc, checkpoint_path)
+            elif self.config.tracto_checkpoints.load_last_checkpoint:
+                incarnation_dir = self.toolbox._training_dir.get_incarnation_path(self.toolbox.coordinator.get_incarnation_id())
+                log_rank("Looking for last checkpoint in Tracto", logger=logger, level=logging.INFO, rank=0)
+                if dist.get_rank(self.parallel_context.world_pg) == 0:
+                    checkpoints = ytc.list(checkpoints_path)
+                    checkpoint_ids = []
+                    for checkpoint in checkpoints:
+                        try:
+                            checkpoint_ids.append(int(checkpoint))
+                        except ValueError:
+                            log_rank(f"Skipping invalid checkpoint: {checkpoint}", logger=logger, level=logging.WARNING)
+                    checkpoint_ids.sort()
+                    checkpoint_index = len(checkpoint_ids) - 1
+                    while checkpoint_index >= 0:
+                        checkpoint_id = checkpoint_ids[checkpoint_index]
+                        latest_path = checkpoints_path + "/" + str(checkpoint_id) + "/" + "latest.txt"
+                        try:
+                            latest = int(ytc.read_file(latest_path).read().decode("utf-8"))
+                        except Exception as e:
+                            log_rank(f"Error reading latest.txt for checkpoint {checkpoint_id}: {e}", logger=logger, level=logging.WARNING)
+                            checkpoint_index -= 1
+                            continue
+                        if latest != checkpoint_id:
+                            log_rank(f"Checkpoint {checkpoint_id} is not valid", logger=logger, level=logging.WARNING)
+                            checkpoint_index -= 1
+                            continue
+                        break
+                    for index in range(checkpoint_index + 1, len(checkpoint_ids)):
+                        checkpoint_id = checkpoint_ids[index]
+                        checkpoint_path = checkpoints_path + "/" + str(checkpoint_id)
+                        new_path = checkpoint_path + ".invalid." + str(self.toolbox.coordinator.get_incarnation_id())
+                        log_rank(f"Moving invalid checkpoint to {new_path}", logger=logger, level=logging.WARNING)
+                        ytc.move(checkpoint_path, new_path)
+
+                    if checkpoint_index >= 0:
+                        checkpoint_id = checkpoint_ids[checkpoint_index]
+                        log_rank(f"Found valid checkpoint {checkpoint_id}", logger=logger, level=logging.INFO)
+                        self.init_checkpoint_storage = CachingTractoStorage(
+                            checkpoints_path + "/" + str(checkpoint_id),
+                            self.config.tracto_checkpoints.tmpfs_path,
+                            ytc,
+                        )
+                        ytc.set(incarnation_dir + "/@checkpoint_id", checkpoint_id)
+                    else:
+                        log_rank("No valid checkpoints found", logger=logger, level=logging.INFO)
+                        ytc.set(incarnation_dir + "/@checkpoint_id", -1)
+                else:
+                    log_rank("Waiting for rank 0 to find the last checkpoint", logger=logger, level=logging.INFO)
+                    while True:
+                        try:
+                            checkpoint_id = ytc.get(incarnation_dir + "/@checkpoint_id")
+                            time.sleep(0.5)
+                            break
+                        except Exception as e:
+                            pass
+                    log_rank(f"Rank 0 found checkpoint {checkpoint_id}", logger=logger, level=logging.INFO)
+                    if checkpoint_id >= 0:
+                        self.init_checkpoint_storage = CachingTractoStorage(
+                            checkpoints_path + "/" + str(checkpoint_id),
+                            self.config.tracto_checkpoints.tmpfs_path,
+                            ytc,
+                        )
+                    else:
+                        self.init_checkpoint_storage = None
+        elif local_path is not None:
+            log_rank("Found checkpoint in local path: " + local_path, logger=logger, level=logging.WARNING, rank=0)
+            self.init_checkpoint_storage = LocalStorage(str(local_path))
+        else:
+            log_rank("No checkpoint path provided.", logger=logger, level=logging.WARNING, rank=0)
+            self.init_checkpoint_storage = None
 
     def post_init(self):
         # S3 Mover and save initial state
@@ -416,7 +513,7 @@ class DistributedTrainer:
     ) -> None:
         self.pre_training(**kwargs)
 
-        if self.config.checkpoints.save_initial_state and self.init_checkpoint_path is None:
+        if self.config.checkpoints.save_initial_state and self.init_checkpoint_storage is None:
             self.save_checkpoint()
 
         self.pipeline_engine: PipelineEngine = self.config.parallelism.pp_engine
@@ -710,18 +807,16 @@ class DistributedTrainer:
 
         # Load or initialize model weights
         reloaded_from_checkpoint = False
-        if self.init_checkpoint_path is not None:
-            # Load from a pre existing checkpoint
-            if check_path_is_local(self.init_checkpoint_path):
-                # Reload from a training checkpoint
-                log_rank(
-                    f"Loading weights from {self.init_checkpoint_path}", logger=logger, level=logging.INFO, rank=0
-                )
-                self.param_shard_metadata = load_weights(
-                    model=unwrapped_model,
-                    parallel_context=self.parallel_context,
-                    root_folder=self.init_checkpoint_path,
-                )
+        if self.init_checkpoint_storage is not None:
+            # Reload from a training checkpoint
+            log_rank(
+                f"Loading weights from checkpoint", logger=logger, level=logging.INFO, rank=0
+            )
+            self.param_shard_metadata = load_weights(
+                model=unwrapped_model,
+                parallel_context=self.parallel_context,
+                storage=self.init_checkpoint_storage,
+            )
             reloaded_from_checkpoint = True
         if not reloaded_from_checkpoint:
             log_rank("No checkpoint path provided.", logger=logger, level=logging.INFO, rank=0)
@@ -869,17 +964,24 @@ class DistributedTrainer:
     def save_checkpoint(self) -> Path:
         self.pre_save_checkpoint()
 
-        checkpoints_path = self.config.checkpoints.checkpoints_path
-        checkpoint_path = checkpoints_path / f"{self.iteration_step}"
-        if self.config.checkpoints.checkpoints_path_is_shared_file_system:
-            should_mkdir = dist.get_rank(self.parallel_context.world_pg) == 0
+        if self.config.tracto_checkpoints:
+            checkpoints_path = self.config.tracto_checkpoints.checkpoints_path
+            checkpoint_path = f"{checkpoints_path}/{self.iteration_step}"
+            storage = TractoStorage(self.toolbox.yt_client, str(checkpoint_path))
+            log_rank(f"Using Tracto storage to save checkpoint at {checkpoint_path}", logger=logger, level=logging.WARNING, rank=0)
         else:
-            should_mkdir = bool(int(os.environ.get("LOCAL_RANK", None)) == 0)
-        if should_mkdir:
-            checkpoint_path.mkdir(parents=True, exist_ok=True)
-        dist.barrier(self.parallel_context.world_pg)
+            checkpoints_path = self.config.checkpoints.checkpoints_path
+            checkpoint_path = checkpoints_path / f"{self.iteration_step}"
+            storage = LocalStorage(str(checkpoint_path))
+            log_rank(f"Using local storage to save checkpoint at {checkpoint_path}", logger=logger, level=logging.WARNING, rank=0)
 
-        log_rank(f"Saving checkpoint at {checkpoint_path}", logger=logger, level=logging.WARNING, rank=0)
+        if self.config.checkpoints.checkpoints_path_is_shared_file_system or self.config.tracto_checkpoints:
+            is_primary = dist.get_rank(self.parallel_context.world_pg) == 0
+        else:
+            is_primary = bool(int(os.environ.get("LOCAL_RANK", None)) == 0)
+        if is_primary:
+            storage.create_directory("")
+        dist.barrier(self.parallel_context.world_pg)
 
         # Update step/samples numbers before we save the config
         self.config.general.step = self.metadata.last_train_step
@@ -894,27 +996,31 @@ class DistributedTrainer:
             ),  # We only save the weights on DP==0
             should_save_optimizer=True,
             should_save_lr_scheduler=bool(
-                dist.get_rank(self.parallel_context.world_pg) == 0
-            ),  # We only save the lr_scheduler on world_rank==0
+                dist.get_rank(self.parallel_context.dp_pg) == 0 and dist.get_rank(self.parallel_context.tp_pg) == 0
+            ),  # We only save the lr_scheduler once per pp-layer.
             should_save_config=bool(
                 dist.get_rank(self.parallel_context.world_pg) == 0
             ),  # We only save the config on world_rank==0
             parallel_context=self.parallel_context,
-            root_folder=checkpoint_path,
+            storage=storage,
             training_metadata=self.metadata,
             config=self.config,
         )
         save_random_states(
-            random_states=self.random_states, parallel_context=self.parallel_context, root_folder=checkpoint_path
+            random_states=self.random_states, parallel_context=self.parallel_context, storage=storage,
         )
-        with open(checkpoints_path / "latest.txt", mode="w") as fo:
-            fo.write(f"{self.iteration_step}")
 
-        if hasattr(self.model_config, "to_json_file"):
-            self.model_config.to_json_file(checkpoint_path / MODEL_CONFIG_FILE_NAME)
-        else:
-            with open(checkpoint_path / MODEL_CONFIG_FILE_NAME, mode="w") as fo:
-                fo.write(json.dumps(asdict(self.model_config)))
+        if is_primary:
+            step = str(self.iteration_step).encode()
+            storage.write_file("latest.txt", step)
+
+            if hasattr(self.model_config, "to_json_file"):
+                # TODO(gritukan): Find out what is it and support for TractoStorage.
+                assert isinstance(storage, LocalStorage)
+                self.model_config.to_json_file(checkpoint_path / MODEL_CONFIG_FILE_NAME)
+            else:
+                config = json.dumps(asdict(self.model_config))
+                storage.write_file(MODEL_CONFIG_FILE_NAME, config.encode())
 
         self.post_save_checkpoint()
 

@@ -1,4 +1,5 @@
 import json
+import fnmatch
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -20,7 +21,7 @@ from nanotron.parallel.parameters import NanotronParameter
 from nanotron.sanity_checks import check_optim_state_in_sync
 from nanotron.serialize.metadata import TensorMetadata
 from nanotron.serialize.utils import ObjectType, merge_and_shard_tp_tensors
-
+from nanotron.serialize.storage import Storage
 
 # TODO(xrsrke): take rank instead of parallel_context
 def optimizer_filename(parallel_context: ParallelContext, is_zero: bool):
@@ -30,15 +31,14 @@ def optimizer_filename(parallel_context: ParallelContext, is_zero: bool):
         return f"{ObjectType.OPTIMIZER.value}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}_tp-{dist.get_rank(parallel_context.tp_pg)}-of-{parallel_context.tp_pg.size()}_exp-{dist.get_rank(parallel_context.expert_pg)}-of-{parallel_context.expert_parallel_size}.pt"
 
 
-def lr_scheduler_filename():
-    """The lr_scheduler is the same for all processes."""
-    return f"{ObjectType.LR_SCHEDULER.value}.pt"
+def lr_scheduler_filename(parallel_context: ParallelContext):
+    return f"{ObjectType.LR_SCHEDULER.value}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}.pt"
 
 
 def save_optimizer(
     optimizer: optim.BaseOptimizer,
     parallel_context: ParallelContext,
-    root_folder: Path,
+    storage: Storage,
 ):
     """Saves optimizer states
     - If Zero-0 is used, optimizer states are replicated across all DPs. Only DP-0 saves the states
@@ -50,76 +50,72 @@ def save_optimizer(
 
     # TODO: Figure out if I need to save param groups. Right now I'm assuming no as we only store what's trainable
     # TODO: We can probably "rotate" so that every process stores something (maybe doesn't matter if we're I/O bound)
-    root_folder = root_folder / "optimizer"
-    root_folder.mkdir(exist_ok=True, parents=True)
+    storage.create_directory("optimizer")
 
     if dist.get_rank(parallel_context.world_pg) == 0:
-        with open(root_folder / "optimizer_config.json", "w") as fo:
-            tp_size = parallel_context.tp_pg.size()
-            pp_size = parallel_context.pp_pg.size()
-            dp_size = parallel_context.dp_pg.size()
-            expert_parallel_size = parallel_context.expert_parallel_size
+        tp_size = parallel_context.tp_pg.size()
+        pp_size = parallel_context.pp_pg.size()
+        dp_size = parallel_context.dp_pg.size()
+        expert_parallel_size = parallel_context.expert_parallel_size
 
-            config = {
-                "type": str(optimizer.__class__.__name__),
-                "parallelism": {
-                    "tp_size": str(tp_size),
-                    "dp_size": str(dp_size),
-                    "pp_size": str(pp_size),
-                    "expert_parallel_size": str(expert_parallel_size),
-                },
-                "configs": {},
-            }
+        config = {
+            "type": str(optimizer.__class__.__name__),
+            "parallelism": {
+                "tp_size": str(tp_size),
+                "dp_size": str(dp_size),
+                "pp_size": str(pp_size),
+                "expert_parallel_size": str(expert_parallel_size),
+            },
+            "configs": {},
+        }
 
-            if isinstance(optimizer, ZeroDistributedOptimizer):
-                # NOTE: in order to serialize, we must save all keys and values as strings
-                def convert_to_string(input_item):
-                    if isinstance(input_item, dict):
-                        return {str(key): convert_to_string(value) for key, value in input_item.items()}
-                    elif isinstance(input_item, list):
-                        return [convert_to_string(element) for element in input_item]
-                    elif isinstance(input_item, tuple):
-                        return tuple(convert_to_string(element) for element in input_item)
-                    else:
-                        return str(input_item)
+        if isinstance(optimizer, ZeroDistributedOptimizer):
+            # NOTE: in order to serialize, we must save all keys and values as strings
+            def convert_to_string(input_item):
+                if isinstance(input_item, dict):
+                    return {str(key): convert_to_string(value) for key, value in input_item.items()}
+                elif isinstance(input_item, list):
+                    return [convert_to_string(element) for element in input_item]
+                elif isinstance(input_item, tuple):
+                    return tuple(convert_to_string(element) for element in input_item)
+                else:
+                    return str(input_item)
 
-                # NOTE: if it's a ZeRO-1 optimzier, then we save how the parameters are sharded
-                # across data parallel dimension, so that we can reconstruct the optimizer states
-                assert optimizer.param_name_to_dp_rank_offsets is not None, "param_name_to_dp_rank_offsets is required"
-                config["configs"]["param_name_to_dp_rank_offsets"] = convert_to_string(
-                    optimizer.param_name_to_dp_rank_offsets
-                )
-                # NOTE: since tp sharded params are flattened, so we need to save the original param shapes
-                # so that we can recontruct the original shapes => reconstruct the unsharded params in tensor parallel dimension
-                config["configs"]["orig_param_shapes"] = convert_to_string(optimizer._orig_param_shapes)
+            # NOTE: if it's a ZeRO-1 optimzier, then we save how the parameters are sharded
+            # across data parallel dimension, so that we can reconstruct the optimizer states
+            assert optimizer.param_name_to_dp_rank_offsets is not None, "param_name_to_dp_rank_offsets is required"
+            config["configs"]["param_name_to_dp_rank_offsets"] = convert_to_string(
+                optimizer.param_name_to_dp_rank_offsets
+            )
+            # NOTE: since tp sharded params are flattened, so we need to save the original param shapes
+            # so that we can recontruct the original shapes => reconstruct the unsharded params in tensor parallel dimension
+            config["configs"]["orig_param_shapes"] = convert_to_string(optimizer._orig_param_shapes)
 
-            json.dump(config, fo)
+        storage.write_file("optimizer/optimizer_config.json", json.dumps(config).encode())
 
     # We dump the optimizer state using `torch.save`
-    torch.save(
+    storage.save(
+        "optimizer/" + optimizer_filename(parallel_context, is_zero=optimizer.inherit_from(optim.ZeroDistributedOptimizer)),
         optimizer.state_dict(),
-        root_folder
-        / optimizer_filename(parallel_context, is_zero=optimizer.inherit_from(optim.ZeroDistributedOptimizer)),
     )
 
 
 def save_lr_scheduler(
     lr_scheduler,
     parallel_context: ParallelContext,
-    root_folder: Path,
+    storage: Storage,
 ):
     """Saves lr scheduler states"""
-    if dist.get_rank(parallel_context.world_pg) > 0:
-        # Only WORLD-RANK 0 saves the lr scheduler state
+    if dist.get_rank(parallel_context.dp_pg) > 0 or dist.get_rank(parallel_context.tp_pg) > 0:
+        # We should save only one copy of the lr scheduler per pp-layer.
         return
 
-    root_folder = root_folder / "lr_scheduler"
-    root_folder.mkdir(exist_ok=True, parents=True)
+    storage.create_directory("lr_scheduler")
 
     # We dump the optimizer state using `torch.save`
-    torch.save(
+    storage.save(
+        "lr_scheduler/" + lr_scheduler_filename(parallel_context),
         lr_scheduler.state_dict(),
-        root_folder / lr_scheduler_filename(),
     )
 
 
@@ -127,17 +123,15 @@ def save_lr_scheduler(
 def load_optimizer(
     optimizer: optim.BaseOptimizer,
     parallel_context: ParallelContext,
-    root_folder: Path,
+    storage: Storage,
     map_location: Optional[str] = None,
     param_shard_metadata: Tuple[Tuple[int, int], TensorMetadata] = None,  # (pp_rank, tp_rank) -> TensorMetadata
     model: Optional[nn.Module] = None,
 ):
-    root_folder = root_folder / "optimizer"
     # `load_state_dict` copies the state dict which can be very large in case of Zero-0 so we load to cpu and then move to the right device
     map_location = "cpu" if not optimizer.inherit_from(optim.ZeroDistributedOptimizer) else map_location
-    ckp_optimizer_config_path = root_folder / "optimizer_config.json"
-    with open(ckp_optimizer_config_path, "r") as file:
-        ckp_optimizer_config = json.load(file)
+    ckp_optimizer_config = storage.read_file("optimizer/optimizer_config.json").decode()
+    ckp_optimizer_config = json.loads(ckp_optimizer_config)
 
     ckp_pp_size = ckp_optimizer_config["parallelism"]["pp_size"]
     ckp_tp_size = ckp_optimizer_config["parallelism"]["tp_size"]
@@ -162,25 +156,28 @@ def load_optimizer(
         if ckp_optim_type == ZeroDistributedOptimizer.__name__:
             # NOTE: if the checkpoint is from a Zero-1 optimizer, then we need to merge the shards
             # across data parallel dimension, before merging the shards across tensor parallel dimension
-            shard_paths = list(
-                root_folder.glob(
-                    f"{ObjectType.OPTIMIZER.value}_pp-*-of-{ckp_pp_size}_dp-*-of-{ckp_dp_size}_tp-*-of-{ckp_tp_size}-exp-*-of-{ckpt_expert_parallel_size}.pt"
-                )
-            )
+            pattern = f"{ObjectType.OPTIMIZER.value}_pp-*-of-{ckp_pp_size}_dp-*-of-{ckp_dp_size}_tp-*-of-{ckp_tp_size}-exp-*-of-{ckpt_expert_parallel_size}.pt"
+            shard_paths = []
+            for path in storage.list_dir("optimizer"):
+                if fnmatch.fnmatch(path, pattern):
+                    shard_paths.append(path)
+
             ckp_sharded_optim_states = merge_dp_shard_in_zero1_optimizer(
                 model, ckp_optimizer_config, shard_paths, parallel_context, map_location
             )
         else:
             # NOTE: if the checkpoint is from a Zero-0 optimizer, then we don't need to merge the shards
             # across data parallel dimension, just directly load the checkpoints
-            shard_paths = list(
-                root_folder.glob(f"{ObjectType.OPTIMIZER.value}_pp-*-of-{ckp_pp_size}_tp-*-of-{ckp_tp_size}.pt")
-            )
+            pattern = f"{ObjectType.OPTIMIZER.value}_pp-*-of-{ckp_pp_size}_tp-*-of-{ckp_tp_size}.pt"
+            shard_paths = []
+            for path in storage.list_dir("optimizer"):
+                if fnmatch.fnmatch(path, pattern):
+                    shard_paths.append(path)
 
             ckp_sharded_optim_states = {}
             for shard_path in shard_paths:
                 pp_rank, tp_rank = extract_parallel_ranks_from_shard_path(shard_path, is_zero1=False)
-                ckp_sharded_optim_states[(pp_rank, tp_rank)] = torch.load(shard_path, map_location=map_location)
+                ckp_sharded_optim_states[(pp_rank, tp_rank)] = storage.load(shard_path, map_location=map_location)
 
         model_state_dict = model.state_dict()
         new_optim_state_dict = optimizer.state_dict()
@@ -282,11 +279,8 @@ def load_optimizer(
         state_dict = new_optim_state_dict
     else:
         # TODO @thomasw21: Load optimizer type and check that it's compatible otherwise we might be be loading something else completely
-        state_dict = torch.load(
-            root_folder
-            / optimizer_filename(parallel_context, is_zero=optimizer.inherit_from(optim.ZeroDistributedOptimizer)),
-            map_location=map_location,
-        )
+        path = "optimizer/" + optimizer_filename(parallel_context, is_zero=optimizer.inherit_from(optim.ZeroDistributedOptimizer))
+        state_dict = storage.load(path, map_location=map_location)
 
     if isinstance(optimizer, ZeroDistributedOptimizer):
         # NOTE: only reshard after merging tp shards
@@ -313,9 +307,8 @@ def load_optimizer(
 
 def load_lr_scheduler(
     lr_scheduler,
-    root_folder: Path,
+    storage: Storage,
+    parallel_context: ParallelContext,
 ):
-    root_folder = root_folder / "lr_scheduler"
-
-    state_dict = torch.load(root_folder / lr_scheduler_filename())
+    state_dict = storage.load("lr_scheduler/" + lr_scheduler_filename(parallel_context))
     lr_scheduler.load_state_dict(state_dict)
