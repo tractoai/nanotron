@@ -6,7 +6,10 @@ import nanotron
 import torch
 from nanotron.config import LlamaConfig as NanotronLlamaConfig
 from nanotron.models.llama import LlamaForTraining
+import nanotron.serialize
 from nanotron.trainer import mark_tied_parameters
+
+import yt.wrapper as yt
 
 
 def get_weight_mapping(config: NanotronLlamaConfig, nt_to_hf: bool = True) -> dict[str, str]:
@@ -101,7 +104,7 @@ def load_nanotron_model(
     model_config: Optional[NanotronLlamaConfig] = None,
     device: torch.device = torch.device("cuda"),
     dtype: torch.dtype = torch.bfloat16,
-    checkpoint_path: Optional[Path] = None,
+    checkpoint_yt_path: Optional[str] = None,
 ) -> LlamaForTraining:
     """
     Creates and returns a nanotron model.
@@ -112,9 +115,9 @@ def load_nanotron_model(
     """
 
     if model_config is None:
-        assert checkpoint_path is not None
-        with open(checkpoint_path / "model_config.json") as f:
-            model_config = NanotronLlamaConfig(**json.load(f))
+        assert checkpoint_yt_path is not None
+        raw_config = yt.read_file(checkpoint_yt_path + "/model_config.json").read().decode()
+        model_config = NanotronLlamaConfig(**json.loads(raw_config))
     parallel_config = make_parallel_config()
     parallel_context = nanotron.parallel.ParallelContext(
         data_parallel_size=parallel_config.dp,
@@ -134,8 +137,10 @@ def load_nanotron_model(
     )
     mark_tied_parameters(model=nanotron_model, parallel_context=parallel_context)
     # Load checkpoint directly in memory and then only keep the state dictionary
-    if checkpoint_path is not None:
+    if checkpoint_yt_path is not None:
+        ytc = yt.YtClient(config=yt.default_config.get_config_from_env())
+        storage = nanotron.serialize.TractoStorage(ytc, checkpoint_yt_path)
         nanotron.serialize.load_weights(
-            model=nanotron_model, parallel_context=parallel_context, root_folder=checkpoint_path
+            model=nanotron_model, parallel_context=parallel_context, storage=storage,
         )
     return nanotron_model
