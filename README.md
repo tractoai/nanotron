@@ -1,3 +1,13 @@
+<h1 align="center">🚜️ Nanotron for TractoAI</h1>
+
+This repository contains a fork of the Nanotron, specifically adapted for TractoAI. The original description of Nanotron is provided below.
+
+Key features of this fork include:
+- [Checkpoints](https://github.com/tractoai/nanotron/tree/main/src/nanotron/serialize) over TractoAI saving and loading, including [asynchronous saving](https://github.com/tractoai/nanotron/blob/main/async_checkpointer.py).
+- Native PyTorch [Dataset](https://github.com/tractoai/nanotron/blob/main/src/nanotron/data/tractoset.py) and [DataLoader](https://github.com/tractoai/nanotron/blob/main/src/nanotron/data/tractoloader.py) for TractoAI, with support for data parallelism and recovering from checkpoints.
+- [Inference](https://github.com/tractoai/nanotron/blob/main/run_generate.py) for TractoAI checkpoints.
+- A [converter](https://github.com/tractoai/nanotron/blob/main/examples/llama/convert_nanotron_to_hf.py) to transform TractoAI checkpoints into Hugging Face format.
+
 <h1 align="center">⚡️ Nanotron</h1>
 
 <p align="center">
