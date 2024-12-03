@@ -6,14 +6,11 @@ import warnings
 
 import fsspec
 import torch
-import numpy as np
 import yt.wrapper as yt
 from torch import Tensor
 
 from tractorun.backend.tractorch.dataset import YtDataset
 from tractorun.backend.tractorch.serializer import TensorSerializer
-
-from nanotron.data.nanoset import Nanoset
 
 
 _T_co = typing.TypeVar("_T_co")
@@ -95,91 +92,3 @@ class TractoTableDataset(YtDataset[_T_co]):
             end=end,
             start=start,
         )
-
-
-class TractoFsFileDataset(torch.utils.data.Dataset):
-    # just a wrapper for Nanoset
-    # download file from YT and store it to the local fs
-    def __init__(
-        self,
-        yt_client: yt.YtClient,
-        yt_dataset_paths: str | list[str],
-        sequence_length: int,
-        token_size: int,
-        train_split_num_samples: int,
-        dataset_weights: float | None = None,
-        random_seed: int = 1234,
-    ) -> None:
-        if isinstance(yt_dataset_paths, str):
-            warnings.warn("dataset_folders should be of type List[str] but str was provided. Converting to List[str]")
-            yt_dataset_paths = [yt_dataset_paths]
-        dataset_dir = tempfile.mkdtemp()
-        for yt_path in yt_dataset_paths:
-            file_name = str(uuid.uuid4())
-            stream = yt_client.read_file(yt_path)
-            with open(file_name, "wb") as f:
-                f.write(stream.read())
-        self.dataset = Nanoset(
-            dataset_folders=[dataset_dir],
-            sequence_length=sequence_length,
-            token_size=token_size,
-            train_split_num_samples=train_split_num_samples,
-            dataset_weights=dataset_weights,
-            random_seed=random_seed,
-        )
-
-    def __len__(self) -> int:
-        """
-        Returns:
-            int: The number of samples of the Nanoset
-        """
-
-        return len(self.dataset)
-
-    def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
-        return self.dataset[idx]
-
-
-class TractoMemFileDataset(torch.utils.data.Dataset):
-    # download file from YT and map it to RAM
-    def __init__(
-        self,
-        yt_client: yt.YtClient,
-        yt_dataset_paths: str | list[str],
-        sequence_length: int,
-        token_size: int,
-        train_split_num_samples: int,
-        dataset_weights: float | None = None,
-        random_seed: int = 1234,
-    ) -> None:
-        if isinstance(yt_dataset_paths, str):
-            warnings.warn("dataset_folders should be of type List[str] but str was provided. Converting to List[str]")
-            yt_dataset_paths = [yt_dataset_paths]
-
-        fs = fsspec.filesystem("memory")
-        dataset_dir = str(uuid.uuid4())
-        for yt_path in yt_dataset_paths:
-            file_name = str(uuid.uuid4())
-            stream = yt_client.read_file(yt_path)
-            with fs.open(f"mem://{dataset_dir}/{file_name}", "wb") as f:
-                f.write(stream.read())
-        self.dataset = Nanoset(
-            dataset_folders=[dataset_dir],
-            sequence_length=sequence_length,
-            token_size=token_size,
-            train_split_num_samples=train_split_num_samples,
-            dataset_weights=dataset_weights,
-            random_seed=random_seed,
-        )
-
-    def __len__(self) -> int:
-        """
-        Returns:
-            int: The number of samples of the Nanoset
-        """
-
-        return len(self.dataset)
-
-    def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
-        return self.dataset[idx]
-

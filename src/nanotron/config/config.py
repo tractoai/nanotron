@@ -129,20 +129,6 @@ class TractoTableDatasetArgs:
 
 
 @dataclass
-class TractoFsFileDatasetArgs:
-    tracto_dataset: Literal["yt_fs_file"]
-    yt_dataset_path: list[str]
-    dataset_weights: Optional[List[float]] = None
-
-
-@dataclass
-class TractoMemFileDatasetArgs:
-    tracto_dataset: Literal["yt_mem_file"]
-    yt_dataset_path: list[str]
-    dataset_weights: Optional[List[float]] = None
-
-
-@dataclass
 class DataArgs:
     """Arguments related to the data and data files processing"""
 
@@ -150,9 +136,7 @@ class DataArgs:
         Union[
             PretrainDatasetsArgs,
             NanosetDatasetsArgs,
-            TractoMemFileDatasetArgs,
             TractoTableDatasetArgs,
-            TractoFsFileDatasetArgs,
         ]
     ]
     seed: Optional[int]
