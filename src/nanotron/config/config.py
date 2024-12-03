@@ -175,6 +175,7 @@ class TractoCheckpointsArgs:
     checkpoints_medium: Optional[str] = None
     load_last_checkpoint: bool = False
     tmpfs_path: Optional[str] = None
+    use_async_saver: bool = False
 
 @dataclass
 class GeneralArgs:

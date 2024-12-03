@@ -402,6 +402,16 @@ class DistributedTrainer:
         if self.s3_mover is not None:
             self.s3_mover.distributed_wait_for_completion(group=self.parallel_context.world_pg)
 
+        if self.config.tracto_checkpoints and self.config.tracto_checkpoints.use_async_saver:
+            log_rank("Waiting for async saver to finish", logger=logger, level=logging.INFO, rank=0)
+            while True:
+                dirs = os.listdir(self.config.checkpoints.checkpoints_path)
+                if len(dirs) != 0:
+                    log_rank("Async saver is still working", logger=logger, level=logging.INFO, rank=0)
+                    time.sleep(10)
+                    continue
+                break
+
     def _print_training_plan(self):
         if hasattr(self.config, "data_stages") and self.config.data_stages is not None:
             stages_info = "".join(
@@ -964,7 +974,7 @@ class DistributedTrainer:
     def save_checkpoint(self) -> Path:
         self.pre_save_checkpoint()
 
-        if self.config.tracto_checkpoints:
+        if self.config.tracto_checkpoints and not self.config.tracto_checkpoints.use_async_saver:
             checkpoints_path = self.config.tracto_checkpoints.checkpoints_path
             checkpoint_path = f"{checkpoints_path}/{self.iteration_step}"
             storage = TractoStorage(self.toolbox.yt_client, str(checkpoint_path))
