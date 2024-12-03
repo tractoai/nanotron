@@ -27,6 +27,7 @@ from nanotron.generation.decode import (
     decode_text,
     decode_tokenized,
 )
+from nanotron.generation.sampler import SamplerType
 from nanotron.logging import log_rank, set_ranks_logging_level
 from nanotron.models import build_model
 from nanotron.parallel import ParallelContext
@@ -42,8 +43,14 @@ from nanotron.random import (
     get_synced_random_state,
     set_random_seed,
 )
-from nanotron.serialize import load_weights
+from nanotron.serialize import load_weights, TractoStorage
 from nanotron.trainer import CONFIG_TO_MODEL_CLASS, mark_tied_parameters
+
+from tractorun.run import prepare_and_get_toolbox
+from tractorun.backend.tractorch import Tractorch
+
+import yt.wrapper as yt
+
 
 try:
     from transformers import AutoTokenizer
@@ -55,7 +62,8 @@ logger = logging.get_logger(__name__)
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt-path", type=Path, required=True, help="Checkpoint path")
+    parser.add_argument("--config-path", type=str, required=True, help="Config path")
+    parser.add_argument("--ckpt-path", type=str, required=True, help="Checkpoint path")
     parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--pp", type=int, default=0)
     parser.add_argument("--tp", type=int, default=0)
@@ -64,11 +72,12 @@ def get_args():
 
 
 def main():
+    toolbox = prepare_and_get_toolbox(backend=Tractorch())
+    os.environ["RANK"] = str(toolbox.coordinator.get_self_index())
+
     args = get_args()
 
-    assert args.ckpt_path.exists(), f"Checkpoint path {args.ckpt_path} does not exist"
-
-    config = get_config_from_file((args.ckpt_path / "config.yaml").as_posix())
+    config = get_config_from_file(args.config_path)
     model_config = config.model.model_config
     tokenizer_path = config.tokenizer.tokenizer_name_or_path
 
@@ -146,7 +155,10 @@ def main():
         level=logging.INFO,
         rank=0,
     )
-    load_weights(model=model, parallel_context=parallel_context, root_folder=checkpoint_path)
+
+    ytc = yt.YtClient(config=yt.default_config.get_config_from_env())
+    storage = TractoStorage(yt_client=ytc, base_path=args.ckpt_path)
+    load_weights(model=model, parallel_context=parallel_context, storage=storage)
 
     model.eval()
     if AutoTokenizer is not None:
@@ -165,9 +177,9 @@ def main():
         tokenizer.truncation_side = "left"  # TODO @nouamane: do we want this?
         dummy_inputs = [
             "The future of AI is",
-            # "Passage: Daniel went back to the garden. Mary travelled to the kitchen. Sandra journeyed to the kitchen. Sandra went to the hallway. John went to the bedroom. Mary went back to the garden. Where is Mary?\nAnswer:",
-            "def fib(n)",
-            # 'Here is an extract from a webpage: "Have you ever experienced heel pain after a heavy physical activity, or even right after a long period of standing? If you regard this as something usual and normal, then think again. Miscalled as heel pain, plantar fasciitis causes these frequent mild pains experienced in the soles of the feet. It is the inflammation and enlargement the plantar fascia tissue that is located in the heels of the feet, stretching to the base of the toes. This tissue is responsible for absorbing shock in the feet and for supporting the arches. It also plays a vital role in foot movements during walking and standing. Many factors such as excessive walking, standing, and running trigger heel pain and plantar fasciitis. A sudden increase in intensity of activities, increase in weight, and abrupt change of footwear also cause the swelling of the ligament. Non-supportive footwear lacking arch cushions and improper and worn out running or training can also lead to the problem. It is also most evident among those". Write an extensive and detailed course unit suitable for a textbook targeted at college students, related to the given extract, within the context of "Medicine". Do not just list concepts, but develop each one in detail before moving to the next, as we prioritize depth of understanding and comprehensive exploration of the subject matter over breadth. Focus on: - Rigor: Ensure in-depth coverage of the concepts/sections. - Engagement: Write with an academic, professional and engaging tone that captivates interest. - Application: Incorporate specific, practical examples, such as proofs in calculus or critical dates and figures in history. Do not include a title or an introduction, simply write the content without headlines and introductory phrases. Do not use images.',
+            #"Passage: Daniel went back to the garden. Mary travelled to the kitchen. Sandra journeyed to the kitchen. Sandra went to the hallway. John went to the bedroom. Mary went back to the garden. Where is Mary?\nAnswer:",
+            #"def fib(n)",
+            'Here is an extract from a webpage: "Have you ever experienced heel pain after a heavy physical activity, or even right after a long period of standing? If you regard this as something usual and normal, then think again. Miscalled as heel pain, plantar fasciitis causes these frequent mild pains experienced in the soles of the feet. It is the inflammation and enlargement the plantar fascia tissue that is located in the heels of the feet, stretching to the base of the toes. This tissue is responsible for absorbing shock in the feet and for supporting the arches. It also plays a vital role in foot movements during walking and standing. Many factors such as excessive walking, standing, and running trigger heel pain and plantar fasciitis. A sudden increase in intensity of activities, increase in weight, and abrupt change of footwear also cause the swelling of the ligament. Non-supportive footwear lacking arch cushions and improper and worn out running or training can also lead to the problem. It is also most evident among those". Write an extensive and detailed course unit suitable for a textbook targeted at college students, related to the given extract, within the context of "Medicine". Do not just list concepts, but develop each one in detail before moving to the next, as we prioritize depth of understanding and comprehensive exploration of the subject matter over breadth. Focus on: - Rigor: Ensure in-depth coverage of the concepts/sections. - Engagement: Write with an academic, professional and engaging tone that captivates interest. - Application: Incorporate specific, practical examples, such as proofs in calculus or critical dates and figures in history. Do not include a title or an introduction, simply write the content without headlines and introductory phrases. Do not use images.',
             # "Advancements in technology will lead to",
             # "Tomorrow's world is shaped by",
         ]
@@ -180,7 +192,7 @@ def main():
             parallel_context=parallel_context,
             max_new_tokens=args.max_new_tokens,
             max_micro_batch_size=2,
-            generation_config=GenerationArgs(sampler="greedy", use_cache=True),
+            generation_config=GenerationArgs(sampler=SamplerType.GREEDY, use_cache=True, top_p=0.8, temperature=0.5),
             tokenizer_config=TokenizerConfig(max_input_length=None),
             is_bench=os.environ.get("USE_BENCH", "0") == "1",
         )
@@ -194,6 +206,13 @@ def main():
 
             log_rank(
                 f"input: {tokenizer.decode(input_ids, clean_up_tokenization_spaces=False)[:1000]}",
+                logger=logger,
+                level=logging.INFO,
+                rank=0,
+            )
+
+            log_rank(
+                f"tokens: {generated_ids}",
                 logger=logger,
                 level=logging.INFO,
                 rank=0,
